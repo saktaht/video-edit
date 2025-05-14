@@ -3,11 +3,42 @@ import numpy as np
 from moviepy.editor import VideoFileClip, concatenate_videoclips
 from glob import glob
 from itertools import chain
-# threshold: 音の大きさ(値が小さいほど小さい音を拾う) 推奨: 0.008~0.015
+# threshold: 音の大きさ None なら自動推定 (20% quantile)
 # min_duration:  音がこの時間以上続いたら音と認識する 推奨: 0.25~0.4 
 # PADDING: カットの前後の余白 推奨: 0.15~0.25
 
-def remove_silence(video_path, output_path, threshold=0.009, min_duration=0.3):
+def estimate_threshold_quantile(volumes: np.ndarray, q: float = 0.20) -> float:
+    """
+    下位 q 分位点をしきい値として返す簡易推定器。
+    """
+    return float(np.quantile(volumes, q))
+
+
+def estimate_threshold_kmeans(volumes: np.ndarray) -> float:
+    """
+    k-means (k=2) で静音クラスタと有音クラスタに分け、
+    静音クラスタの中心＋αをしきい値にする。
+    scikit-learn がインストールされていない場合は呼び出さないこと。
+    """
+    try:
+        from sklearn.cluster import KMeans
+    except ModuleNotFoundError:
+        # fallback – quantile 20% 相当を返す
+        return estimate_threshold_quantile(volumes, q=0.15)
+
+    km = KMeans(n_clusters=2, n_init=10, random_state=0).fit(volumes.reshape(-1, 1))
+    quiet, loud = sorted(km.cluster_centers_.flatten())
+    return quiet + 0.15 * (loud - quiet)
+
+# def remove_silence(video_path, output_path, threshold=None, min_duration=0.3, quantile_q=0.20, use_kmeans=False):
+def remove_silence(
+    video_path,
+    output_path,
+    threshold: float | None = None,
+    min_duration: float = 0.3,
+    quantile_q: float = 0.20,
+    use_kmeans: bool = True,
+):
     video = VideoFileClip(video_path)
     audio = video.audio
     fps = audio.fps
@@ -16,6 +47,14 @@ def remove_silence(video_path, output_path, threshold=0.009, min_duration=0.3):
     frames = list(audio.iter_frames())
     samples = np.vstack(frames)
     volume = np.mean(np.abs(samples), axis=1)
+
+    # 動画ごとに自動でしきい値を推定
+    if threshold is None:
+        if use_kmeans:
+            threshold = estimate_threshold_kmeans(volume)
+        else:
+            threshold = estimate_threshold_quantile(volume, q=quantile_q)
+    print(f"[{os.path.basename(video_path)}] threshold = {threshold:.5f}")
 
     # 平滑化（0.1秒単位）
     window_size = int(fps * 0.1)
@@ -40,7 +79,7 @@ def remove_silence(video_path, output_path, threshold=0.009, min_duration=0.3):
         intervals.append((start, times[-1]))
 
     # --- 追加: 前後に余白を入れてブツ切り感を緩和 ---
-    PADDING = 0.2  # 秒
+    PADDING = 1.0  # 秒
     padded = []
     for s, e in intervals:
         s = max(0, s - PADDING)
@@ -62,7 +101,6 @@ def remove_silence(video_path, output_path, threshold=0.009, min_duration=0.3):
 
 def batch_process(input_dir, output_dir):
     os.makedirs(output_dir, exist_ok=True)
-    # files = glob(os.path.join(input_dir, "*.mov"))
     patterns = ["*.mov", "*.MOV", "*.mp4", "*.MP4"]
     files = list(chain.from_iterable(glob(os.path.join(input_dir, p)) for p in patterns))
     for f in files:

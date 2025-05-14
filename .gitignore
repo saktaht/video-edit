@@ -2,3 +2,4 @@ myvenv
 input_videos
 output_videos
 .DS_Store
+*.MOV
